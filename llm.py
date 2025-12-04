@@ -5,183 +5,126 @@ from langchain_core.output_parsers import StrOutputParser
 from llm_utils import _common_llm_params, resolve_model_config, get_model_choices
 from config import OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
 import logging
-import re
-
 import warnings
 
 warnings.filterwarnings("ignore")
 
+# Global system_prompt initialization (optimized for flexibility and customizability)
+system_prompt = """
+You are a Cybercrime Threat Intelligence Expert. Your task is to refine, filter, or generate analysis based on the provided user query or dark web search engine results.
+
+### For Refining Queries:
+1. Analyze the user query and think about how it can be improved for dark web search engines.
+2. Refine the query by adding or removing words to ensure the best results from dark web search engines.
+3. Avoid logical operators like AND, OR, etc.
+4. Output just the refined user query.
+
+### For Filtering Results:
+1. You are given a dark web search query and a list of search results in the form of index, link, and title.
+2. Select the most relevant results that best match the search query.
+3. Output only the indices (comma-separated list), up to the number specified in the "max_results" variable.
+4. Search Query: {query}
+5. Search Results: {results}
+6. Max Results: {max_results}
+
+### For Generating Summary:
+1. You are tasked with generating context-based technical investigative insights from the provided dark web OSINT data.
+2. Analyze the raw text, links, and data provided.
+3. Output the source links used for the analysis and provide a detailed, evidence-based technical analysis.
+4. Identify and list intelligence artifacts such as names, emails, phones, cryptocurrency addresses, domains, dark web markets, forum names, malware names, etc.
+5. Generate key insights based on the data, as many as required by the "max_insights" variable, each actionable and context-based.
+6. Include suggested next steps for investigating the topic further.
+7. Provide a structured and clear format with section headings.
+
+### INPUTS:
+- User Query: {query}
+- Search Results or Content: {results_or_content}
+- Max Results: {max_results}
+- Max Insights: {max_insights}
+"""
 
 def get_llm(model_choice):
     # Look up the configuration (cloud or local Ollama)
     config = resolve_model_config(model_choice)
-
+    
     if config is None:  # Extra error check
         supported_models = get_model_choices()
         raise ValueError(
             f"Unsupported LLM model: '{model_choice}'. "
             f"Supported models (case-insensitive match) are: {', '.join(supported_models)}"
         )
-
+    
     # Extract the necessary information from the configuration
     llm_class = config["class"]
     model_specific_params = config["constructor_params"]
-
+    
     # Combine common parameters with model-specific parameters
-    # Model-specific parameters will override common ones if there are any conflicts
     all_params = {**_common_llm_params, **model_specific_params}
-
+    
     # Create the LLM instance using the gathered parameters
     llm_instance = llm_class(**all_params)
-
+    
     return llm_instance
 
-
 def refine_query(llm, user_input):
-    system_prompt = """
-    You are a Cybercrime Threat Intelligence Expert. Your task is to refine the provided user query that needs to be sent to darkweb search engines. 
-    
-    Rules:
-    1. Analyze the user query and think about how it can be improved to use as search engine query
-    2. Refine the user query by adding or removing words so that it returns the best result from dark web search engines
-    3. Don't use any logical operators (AND, OR, etc.)
-    4. Output just the user query and nothing else
-
-    INPUT:
-    """
-    prompt_template = ChatPromptTemplate(
-        [("system", system_prompt), ("user", "{query}")]
-    )
+    prompt_template = ChatPromptTemplate([("system", system_prompt), ("user", "{query}")])
     chain = prompt_template | llm | StrOutputParser()
     return chain.invoke({"query": user_input})
 
-
-def filter_results(llm, query, results):
+def filter_results(llm, query, results, max_results=20):
     if not results:
         return []
-
-    system_prompt = """
-    You are a Cybercrime Threat Intelligence Expert. You are given a dark web search query and a list of search results in the form of index, link and title. 
-    Your task is select the Top 20 relevant results that best match the search query for user to investigate more.
-    Rule:
-    1. Output ONLY atmost top 20 indices (comma-separated list) no more than that that best match the input query
-
-    Search Query: {query}
-    Search Results:
-    """
-
+    
     final_str = _generate_final_string(results)
-
-    prompt_template = ChatPromptTemplate(
-        [("system", system_prompt), ("user", "{results}")]
-    )
+    prompt_template = ChatPromptTemplate([("system", system_prompt), ("user", "{results}")])
     chain = prompt_template | llm | StrOutputParser()
+
     try:
-        result_indices = chain.invoke({"query": query, "results": final_str})
+        result_indices = chain.invoke({"query": query, "results": final_str, "max_results": max_results})
     except openai.RateLimitError as e:
-        print(
-            f"Rate limit error: {e} \n Truncating to Web titles only with 30 characters"
-        )
+        print(f"Rate limit error: {e} \n Truncating to Web titles only with 30 characters")
         final_str = _generate_final_string(results, truncate=True)
-        result_indices = chain.invoke({"query": query, "results": final_str})
-
-    # Select top_k results using original (non-truncated) results
-    parsed_indices = []
-    for match in re.findall(r"\d+", result_indices):
-        try:
-            idx = int(match)
-            if 1 <= idx <= len(results):
-                parsed_indices.append(idx)
-        except ValueError:
-            continue
-
+        result_indices = chain.invoke({"query": query, "results": final_str, "max_results": max_results})
+    
+    parsed_indices = [int(match) for match in re.findall(r"\d+", result_indices) if 1 <= int(match) <= len(results)]
+    
     # Remove duplicates while preserving order
     seen = set()
-    parsed_indices = [
-        i for i in parsed_indices if not (i in seen or seen.add(i))
-    ]
-
+    parsed_indices = [i for i in parsed_indices if not (i in seen or seen.add(i))]
+    
     if not parsed_indices:
         logging.warning(
             "Unable to interpret LLM result selection ('%s'). "
             "Defaulting to the top %s results.",
             result_indices,
-            min(len(results), 20),
+            min(len(results), max_results),
         )
-        parsed_indices = list(range(1, min(len(results), 20) + 1))
-
-    top_results = [results[i - 1] for i in parsed_indices[:20]]
-
+        parsed_indices = list(range(1, min(len(results), max_results) + 1))
+    
+    top_results = [results[i - 1] for i in parsed_indices[:max_results]]
+    
     return top_results
 
-
 def _generate_final_string(results, truncate=False):
-    """
-    Generate a formatted string from the search results for LLM processing.
-    """
-
-    if truncate:
-        # Use only the first 35 characters of the title
-        max_title_length = 30
-        # Do not use link at all
-        max_link_length = 0
-
+    """Generate a formatted string from the search results for LLM processing."""
     final_str = []
     for i, res in enumerate(results):
         # Truncate link at .onion for display
         truncated_link = re.sub(r"(?<=\.onion).*", "", res["link"])
         title = re.sub(r"[^0-9a-zA-Z\-\.]", " ", res["title"])
+
         if truncated_link == "" and title == "":
             continue
-
+        
         if truncate:
-            # Truncate title to max_title_length characters
-            title = (
-                title[:max_title_length] + "..."
-                if len(title) > max_title_length
-                else title
-            )
-            # Truncate link to max_link_length characters
-            truncated_link = (
-                truncated_link[:max_link_length] + "..."
-                if len(truncated_link) > max_link_length
-                else truncated_link
-            )
-
+            title = (title[:30] + "..." if len(title) > 30 else title)
+            truncated_link = (truncated_link[:0] + "..." if len(truncated_link) > 0 else truncated_link)
+        
         final_str.append(f"{i+1}. {truncated_link} - {title}")
-
+    
     return "\n".join(s for s in final_str)
 
-
-def generate_summary(llm, query, content):
-    system_prompt = """
-    You are an Cybercrime Threat Intelligence Expert tasked with generating context-based technical investigative insights from dark web osint search engine results.
-
-    Rules:
-    1. Analyze the Darkweb OSINT data provided using links and their raw text.
-    2. Output the Source Links referenced for the analysis.
-    3. Provide a detailed, contextual, evidence-based technical analysis of the data.
-    4. Provide intellgience artifacts along with their context visible in the data.
-    5. The artifacts can include indicators like name, email, phone, cryptocurrency addresses, domains, darkweb markets, forum names, threat actor information, malware names, TTPs, etc.
-    6. Generate 3-5 key insights based on the data.
-    7. Each insight should be specific, actionable, context-based, and data-driven.
-    8. Include suggested next steps and queries for investigating more on the topic.
-    9. Be objective and analytical in your assessment.
-    10. Ignore not safe for work texts from the analysis
-
-    Output Format:
-    1. Input Query: {query}
-    2. Source Links Referenced for Analysis - this heading will include all source links used for the analysis
-    3. Investigation Artifacts - this heading will include all technical artifacts identified including name, email, phone, cryptocurrency addresses, domains, darkweb markets, forum names, threat actor information, malware names, etc.
-    4. Key Insights
-    5. Next Steps - this includes next investigative steps including search queries to search more on a specific artifacts for example or any other topic.
-
-    Format your response in a structured way with clear section headings.
-
-    INPUT:
-    """
-    prompt_template = ChatPromptTemplate(
-        [("system", system_prompt), ("user", "{content}")]
-    )
+def generate_summary(llm, query, content, max_insights=5):
+    prompt_template = ChatPromptTemplate([("system", system_prompt), ("user", "{content}")])
     chain = prompt_template | llm | StrOutputParser()
-    return chain.invoke({"query": query, "content": content})
+    return chain.invoke({"query": query, "content": content, "max_insights": max_insights})
